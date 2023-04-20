@@ -1,0 +1,139 @@
+import torch
+import gymnasium as gym
+import pickle
+from gymnasium.utils.save_video import save_video
+from torch import nn
+from torch.optim import Adam
+from torch.distributions import Categorical
+from utils import *
+
+
+class PGT:
+    def __init__(self, param):
+        self.param = param
+        self.enviroment = gym.make(self.param['enviroment_name'])
+        self.agent = Agent(enviroment=self.enviroment, param=self.param)
+        self.act_policy = PGPolicy(input_size=self.enviroment.observation_space.shape[0], output_size=self.enviroment.action_space.n, hidden_dim=self.param['hidden_dim']).to(get_device())
+        self.optimizer = Adam(param=self.act_policy.parameters(), lr=self.param['lr'])
+
+    def run_training_loop(self):
+        list_reward = list()
+
+        for ro_idx in range(self.param['n_rollout']):
+            path = self.agent.collect_path(policy=self.act_policy)
+            loss = self.estimate_loss_function(path)
+            self.update_policy(loss)
+            total_reward = 0
+            for t_idx in range(self.param['n_path_per_rollout']):
+                for r_idx in range(len((path['reward'])[t_idx])):
+                    total_reward += path['reward'][t_idx][r_idx]
+            avg_ro_reward = total_reward/self.param['n_path_per_rollout']
+            print(f'End of rollout {ro_idx}: Average path reward is {avg_ro_reward: 0.2f}')
+            list_reward.append(avg_ro_reward)
+        pkl_file_name = self.param['exp_name'] + '.pkl'
+        with open(pkl_file_name, 'wb') as f:
+            pickle.dump(list_reward, f)
+        self.generate_video()
+        self.enviroment.close()
+
+    def estimate_loss_function(self, path):
+        loss = list()
+        # if self.param['reward_to_go']:
+        #     print("Using reward-to-go: eq7")
+        # elif self.param['reward_discount']:
+        #     print("Using reward-discounting: eq8")
+        # else:
+        #     print("Using basic rewards: eq6")
+        # print(path)
+        for t_idx in range(self.param['n_path_per_rollout']):
+            # print(path['log_prob'][t_idx])
+            if self.param['reward_to_go']:
+                # print(path['log_prob'][t_idx])
+                rewards_to_go = apply_reward_to_go(path['reward'][t_idx])
+                curr_loss = 0 
+                for r_idx in range(len(rewards_to_go)):
+                    curr_loss +=(-path['log_prob'][t_idx][r_idx] * rewards_to_go[r_idx])
+                # print(curr_loss)
+                loss.append(curr_loss/self.param['n_path_per_rollout'])
+            elif self.param['reward_discount']:
+                # print(path['log_prob'][t_idx])
+                discounted_rewards = apply_discount(path['reward'][t_idx])
+                curr_loss = 0 
+                for r_idx in range(len(discounted_rewards)):
+                    curr_loss +=(-path['log_prob'][t_idx][r_idx] * discounted_rewards[r_idx])
+                # print(curr_loss)
+                loss.append(curr_loss/self.param['n_path_per_rollout'])
+            else:
+                log_prob = torch.sum(path['log_prob'][t_idx])
+                path_reward = 0
+                for r_idx in range(len((path['reward'])[t_idx])):
+                    path_reward += path['reward'][t_idx][r_idx]
+                # for l_idx in range(len((path['log_prob'])[t_idx])):
+                #     log_prob += path['log_prob'][t_idx][l_idx]
+                loss.append(-log_prob * path_reward/self.param['n_path_per_rollout'])
+        # print(loss)
+        loss = torch.stack(loss).mean()
+        return loss
+
+    def update_policy(self, loss):
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+    def generate_video(self, max_frame=1000):
+        self.enviroment = gym.make(self.param['enviroment_name'], render_mode='rgb_array_list')
+        obs, _ = self.enviroment.reset()
+        for _ in range(max_frame):
+            action_idx, log_prob = self.act_policy(torch.tensor(obs, dtype=torch.float32, device=get_device()))
+            obs, reward, terminated, truncated, info = self.enviroment.step(self.agent.action_space[action_idx.item()])
+            if terminated or truncated:
+                break
+        save_video(frames=self.enviroment.render(), video_folder=self.param['enviroment_name'][:-3], fps=self.enviroment.metadata['render_fps'], step_starting_index=0, episode_index=0)
+
+class PGPolicy(nn.Module):
+    def __init__(self, input_size, output_size, hidden_dim):
+        super(PGPolicy, self).__init__()
+        self.policy_net = nn.Sequential( #sequential operation
+            nn.Linear(input_size,hidden_dim), 
+            nn.ReLU(), 
+            nn.Linear(hidden_dim,output_size), 
+            nn.Softmax( dim=-1))
+
+    def forward(self, obs):
+        probabilities = Categorical(self.policy_net(obs))
+        action_index = probabilities.sample()
+        # print(action_index)
+        log_prob = probabilities.log_prob(action_index)
+        action_index =  action_index.data.numpy().astype('int32')
+        return action_index, log_prob
+
+class Agent:
+    def __init__(self, enviroment, param=None):
+        self.enviroment = enviroment
+        self.param = param
+        self.action_space = [action for action in range(self.enviroment.action_space.n)]
+
+    def collect_path(self, policy):
+        obs, _ = self.enviroment.reset(seed=self.param['rng_seed'])
+        rollout_buffer = list()
+        for _ in range(self.param['n_path_per_rollout']):
+            path_buffer = {'log_prob': list(), 'reward': list()}
+            while True:
+                action_idx, log_prob = policy.forward(obs = torch.tensor(obs, dtype=torch.float32, device=get_device()))
+                obs, reward, terminated, truncated, info = self.enviroment.step(action = action_idx)
+                path_buffer['log_prob'].append(log_prob)
+                path_buffer['reward'].append(reward)
+                if terminated or truncated:
+                    obs, _ = self.enviroment.reset()
+                    rollout_buffer.append(path_buffer)
+                    break
+        rollout_buffer = self.serialize_path(rollout_buffer)
+        return rollout_buffer
+
+    @staticmethod
+    def serialize_path(rollout_buffer):
+        serialized_buffer = {'log_prob': list(), 'reward': list()}
+        for path_buffer in rollout_buffer:
+            serialized_buffer['log_prob'].append(torch.stack(path_buffer['log_prob']))
+            serialized_buffer['reward'].append(path_buffer['reward'])
+        return serialized_buffer
